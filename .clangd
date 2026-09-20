@@ -1,0 +1,13 @@
+CompileFlags:
+  Add:
+    - --cuda-path=C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9
+    - -IC:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9/include
+    - -LC:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9/lib/x64
+
+---
+If:
+  PathMatch: "./src/*.cu"
+CompileFlags:
+  Add:
+    - -x=cuda
+    - --cuda-gpu-arch=sm_86
