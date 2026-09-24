@@ -2,7 +2,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cuda/__cmath/ceil_div.h>
+#include <cstring>
 #include <cuda_device_runtime_api.h>
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
@@ -27,124 +27,162 @@ union TableValue {
     void* as_ptr;
 };
 
-struct Table {
-    size_t* rowIdx;    // {1,    2,    3,      4,    ...}
-    size_t* colIdx;    // {1,    2,    3,      4,    ...}
-    TYPE_ID* typeIds;  // {INT,  INT,  STRING, CHAR, ...}
-    TableValue* data;  // {data, data, data,   data, ...}
+// all columns have the same type of data
+struct Column {
+    TYPE_ID typeId;
+    size_t colIdx;
+    size_t numRows;
+    TableValue* data; // {data, 
+                      //  data, 
+                      //  data, 
+                      //  data,
+                      //  ...}
 };
 
-__global__ void SUM(Table* dataset, size_t datalen, double* sum) {
-    uint64_t kernelDatasetIdx = threadIdx.x + blockDim.x * blockIdx.x;
-    if (kernelDatasetIdx >= datalen)
-        return;
+// columnar table version
+struct Table {
+    Column** columns;
+    size_t numCols;
+    size_t numRows;
+};
 
-    size_t rowIdx = dataset->rowIdx[kernelDatasetIdx];
-    size_t colIdx = dataset->colIdx[kernelDatasetIdx];
-    TYPE_ID typeId = dataset->typeIds[kernelDatasetIdx];
-    TableValue data = dataset->data[kernelDatasetIdx];
-    
-    switch (typeId) {
-        case FLOAT: {
-            atomicAdd(sum, data.as_float);
-            break;
-        }
-        case INT: {
-            atomicAdd(sum, data.as_int);
-            break;
-        }
-        default:
-            printf("unsupported type for SUM operation.\n");
-            break;
+__global__ void DIV(Column col, double divisor) {
+    uint64_t kernelDatasetIdx = threadIdx.x + blockDim.x * blockIdx.x;
+    if (kernelDatasetIdx > col.numRows) {
+        return;
     }
+    
+    if (divisor == 0) {
+        printf("error in div: divisor provided in 0. cannot divide by 0\n");
+        return;
+    }
+    
+    if (col.typeId != TYPE_ID::INT && col.typeId != TYPE_ID::FLOAT) {
+        printf("error unsupported div operation of data not of type INT or FLOAT.\n");
+        return;
+    }
+
+    TableValue* tableValue = &col.data[kernelDatasetIdx];
+    if (tableValue->as_ptr == nullptr) {
+        return;
+    }
+
+    tableValue->as_int /= divisor;
 }
 
-__global__ void DIV(Table* dataset, size_t datalen, size_t divisor) {
-    if (divisor == 0) // div by 0
-        return;
-
+__global__ void SUM(Column col, int* result) {
     uint64_t kernelDatasetIdx = threadIdx.x + blockDim.x * blockIdx.x;
-    if (kernelDatasetIdx >= datalen)
+    if (kernelDatasetIdx > col.numRows) {
         return;
+    }
+    printf("%llu + %d\n", col.data[kernelDatasetIdx].as_int, *result);
+    atomicAdd(result, col.data[kernelDatasetIdx].as_int);
+}
 
-    TYPE_ID typeId = dataset->typeIds[kernelDatasetIdx];
-    TableValue* data = &dataset->data[kernelDatasetIdx];
-    
-    switch (typeId) {
-        case FLOAT: {
-            break;
+void printDataset(Table* dataset) {
+    for (size_t i = 0; i < dataset->numRows; i++) {
+        for (size_t j = 0; j < dataset->numCols; j++) {
+            Column* col = dataset->columns[j];
+
+            switch (col->typeId) {
+                case TYPE_ID::INT:
+                    printf("%-7lld", col->data[i].as_int);
+                    break;
+                case TYPE_ID::FLOAT:
+                    printf("%-7f", col->data[i].as_float);
+                    break;
+                default:
+                    printf("%-7s", "UNIMPLEMENTED");
+                    break;
+            }
         }
-        case INT: {
-            data->as_int /= divisor;
-            break;
-        }
-        default:
-            printf("unsupported type for SUM operation.\n");
-            break;
+
+        printf("\n");
     }
 }
 
 int main() {
-    Table* dataset = nullptr;
-    size_t datalen = 0;
-    
-    cudaMallocManaged(&dataset, sizeof(Table));
-    cudaMallocManaged(&dataset->rowIdx, 1000* sizeof(size_t));
-    cudaMallocManaged(&dataset->colIdx, 1000* sizeof(size_t));
-    cudaMallocManaged(&dataset->typeIds, 1000* sizeof(TYPE_ID));
-    cudaMallocManaged(&dataset->data, 2048*sizeof(uint64_t));
+    const uint32_t COLUMN_ARRAY_SIZE = 100 * sizeof(Column*);
+    const uint32_t DATASET_SIZE = sizeof(Table) + COLUMN_ARRAY_SIZE;
+    const uint32_t COLUMN_DATA_SIZE = 100 * sizeof(TableValue);
+    const uint32_t COLUMN_SIZE = sizeof(Column) + COLUMN_DATA_SIZE;
+
+    // malloc dataset on host
+    Table* dataset = (Table*)malloc(DATASET_SIZE);
+    dataset->columns = (Column**)malloc(COLUMN_ARRAY_SIZE);
+    dataset->numCols = 0;
+    dataset->numRows = 0;
     
     // populate with dummy data
-    for (size_t i=0; i<10; i++){
-        dataset->rowIdx[i] = i+1;
-        dataset->colIdx[i] = i+1;
-        dataset->typeIds[i] = TYPE_ID::INT;
-        dataset->data[i].as_int = 5;
-
-        datalen += 1;
+    for (size_t i=0; i<6; i++){
+        // malloc column on host
+        Column* col = (Column*)malloc(COLUMN_SIZE);
+        col->data = (TableValue*)malloc(COLUMN_DATA_SIZE);
+        col->typeId = TYPE_ID::INT;
+        col->colIdx = i;
+        col->numRows = 0;
+        
+        for (int j=0; j<20; j++) {
+            col->numRows = j+1;
+            col->data[j].as_int = 10;
+            dataset->numRows = col->numRows;
+        }
+        
+        dataset->columns[i] = col;
+        dataset->numCols = i+1;
     }
 
-    size_t threads = 256;
-    size_t blocks = cuda::ceil_div(datalen, threads);
+    printDataset(dataset);
     
-    // double* sum = nullptr;
-    // cudaMallocManaged(&sum, sizeof(double));
-    
-    // SUM<<<blocks, threads>>>(dataset, datalen, sum);
-    DIV<<<blocks, threads>>>(dataset, datalen, 5);
+    int* hostDatasetSum = (int*)malloc(sizeof(int));
+    int* gpuDatasetSum = nullptr;
+    cudaMalloc(&gpuDatasetSum, sizeof(int));
+    cudaMemset(gpuDatasetSum, 0, sizeof(int));
+
+    // send all the relevant dataset columns from the host memory to the gpu
+    for (size_t i = 0; i < dataset->numCols; i++) {
+        Column* hostColumn = dataset->columns[i];
+        size_t rowDataSize = sizeof(TableValue) * hostColumn->numRows;
+        Column gpuColumn = *hostColumn;
+
+        cudaMalloc(&gpuColumn.data, rowDataSize);
+        cudaMemcpy(
+            gpuColumn.data, 
+            hostColumn->data, 
+            rowDataSize,
+            cudaMemcpyHostToDevice
+        );
+
+        DIV<<<3, 10>>>(gpuColumn, 10);
+        SUM<<<2, 10>>>(gpuColumn, gpuDatasetSum); // get sum of everything in the dataset
+
+        // bring data modified on the gpu back to host
+        // perhaps modify the data in DIV in shared memory then 
+        // memcpy all the shared memory back into hostcolumns at once
+        // rather than in this for loop
+        cudaMemcpy(
+            hostColumn->data, 
+            gpuColumn.data, 
+            rowDataSize,
+            cudaMemcpyDeviceToHost
+        );
+        cudaFree(gpuColumn.data);
+    }
+
     cudaDeviceSynchronize();
 
-    for (size_t i=0; i<datalen; i++) {
-        size_t rowIdx = dataset->rowIdx[i];
-        size_t colIdx = dataset->colIdx[i];
-        TYPE_ID typeId = dataset->typeIds[i];
-        TableValue data = dataset->data[i];
+    cudaMemcpy(
+        hostDatasetSum,
+        gpuDatasetSum,
+        sizeof(int),
+        cudaMemcpyDeviceToHost
+    );
 
-        printf("i[%lld, tid: %d] = ", i, typeId);
+    printf("sum of everything: %d\n", *hostDatasetSum);
 
-        switch (typeId) {
-            case FLOAT: {
-                // double as_dbl = reinterpret_cast<double>(data);
-                // printf("%f\n", as_dbl);
-                break;
-            }
-            case INT: {
-                printf("%lld\n", data.as_int);
-                break;
-            }
-            default:
-                printf("unsupported type for SUM operation.\n");
-        }
-    }
-
-    // printf("Sum is %f\n", *sum);
-
-    cudaFree(dataset);
-    cudaFree(dataset->rowIdx);
-    cudaFree(dataset->colIdx);
-    cudaFree(dataset->typeIds);
-    cudaFree(dataset->data);
-    // cudaFree(sum);
+    printDataset(dataset);
+    free(dataset->columns);
+    free(dataset);
 
     return 0;
 }
