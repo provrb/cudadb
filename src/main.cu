@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -10,167 +12,150 @@
 #include <stdio.h>
 #include <inttypes.h>
 #include <cuda/cmath>
+#include <assert.h>
+#include <iostream>
+#include <iomanip>
 
-// struct of arrays
-// instead of arrays of structs. e.g.: aos={{x,y,z}, {a,b,c}}
+// config
+constexpr uint8_t MAX_ARRAY_VALUES = 200;
 
-enum TYPE_ID {
-    INT = 1,
-    STRING,
-    CHAR,
-    FLOAT
-};
-
-union TableValue {
-    uint64_t as_int;
-    double as_float;
-    void* as_ptr;
-};
-
-// all columns have the same type of data
+template <typename T>
 struct Column {
-    TYPE_ID typeId;
     size_t colIdx;
-    size_t numRows;
-    TableValue* data; // {data, 
-                      //  data, 
-                      //  data, 
-                      //  data,
-                      //  ...}
+    size_t numRows; // len of data
+    T* rowCells;    // {data, 
+                    //  data, 
+                    //  data, 
+                    //  data,
+                    //  ...}
+
+    Column<T>(size_t colIdx)
+        : rowCells(new T[MAX_ARRAY_VALUES]), colIdx(colIdx), numRows(0) {
+    }
+
+    // Move all data from this Column into a Column based on device memory. Malloc space for rowCells.
+    __host__ Column memMoveToDevice() {
+        size_t rowDataSize = sizeof(T) * this->numRows;
+        Column<T> gpuColumn = *this;
+
+        cudaMalloc(&gpuColumn.rowCells, rowDataSize);
+        cudaMemcpy(
+            gpuColumn.rowCells, 
+            this->rowCells, 
+            rowDataSize,
+            cudaMemcpyHostToDevice
+        );
+
+        return gpuColumn;
+    }
+
+    // Move this rowCells data from GPU memory into hostColumns CPU memory. Free devices rowCells field.
+    // In the future, could use a queue. 
+    // Push columns to move from gpu to host and then chunk the requests instead of doing one every for-loop
+    __host__ void memMoveToHost(Column* __restrict__ hostColumn) {    
+        cudaMemcpy(
+            hostColumn->rowCells, 
+            this->rowCells, 
+            sizeof(T) * this->numRows,
+            cudaMemcpyDeviceToHost
+        );
+        cudaFree(this->rowCells);
+    }
 };
 
 // columnar table version
 struct Table {
-    Column** columns;
+    void** columns;
     size_t numCols;
     size_t numRows;
+
+    __host__ Table()
+        : columns(new void*[MAX_ARRAY_VALUES]), numCols(0), numRows(0) {
+    };
+
+    __host__ ~Table() {
+        delete[] columns;
+    }
+
+    template<typename T>
+    __host__ __device__ inline Column<T>* getColumn(const size_t& index) {
+        return reinterpret_cast<Column<T>*>(this->columns[index]);
+    }
 };
 
-__global__ void DIV(Column col, double divisor) {
+template <typename T>
+__global__ void DIV(Column<T> col, double divisor) {
+    if (divisor == 0) return;
+    if (!cuda::std::is_arithmetic<T>::value) {
+        printf("error unsupported div operation of data not of arithmetic type.\n");
+        return;
+    }
+    
     uint64_t kernelDatasetIdx = threadIdx.x + blockDim.x * blockIdx.x;
-    if (kernelDatasetIdx > col.numRows) {
-        return;
-    }
-    
-    if (divisor == 0) {
-        printf("error in div: divisor provided in 0. cannot divide by 0\n");
-        return;
-    }
-    
-    if (col.typeId != TYPE_ID::INT && col.typeId != TYPE_ID::FLOAT) {
-        printf("error unsupported div operation of data not of type INT or FLOAT.\n");
-        return;
-    }
+    if (kernelDatasetIdx > col.numRows) return;
 
-    TableValue* tableValue = &col.data[kernelDatasetIdx];
-    if (tableValue->as_ptr == nullptr) {
-        return;
-    }
-
-    tableValue->as_int /= divisor;
+    *(&col.rowCells[kernelDatasetIdx]) /= divisor;
 }
 
-__global__ void SUM(Column col, int* result) {
+template <typename T>
+__global__ void SUM(Column<T> col, int* result) {
     uint64_t kernelDatasetIdx = threadIdx.x + blockDim.x * blockIdx.x;
     if (kernelDatasetIdx > col.numRows) {
         return;
     }
-    printf("%llu + %d\n", col.data[kernelDatasetIdx].as_int, *result);
-    atomicAdd(result, col.data[kernelDatasetIdx].as_int);
+
+    atomicAdd(result, col.rowCells[kernelDatasetIdx]);
 }
 
 void printDataset(Table* dataset) {
     for (size_t i = 0; i < dataset->numRows; i++) {
         for (size_t j = 0; j < dataset->numCols; j++) {
-            Column* col = dataset->columns[j];
-
-            switch (col->typeId) {
-                case TYPE_ID::INT:
-                    printf("%-7lld", col->data[i].as_int);
-                    break;
-                case TYPE_ID::FLOAT:
-                    printf("%-7f", col->data[i].as_float);
-                    break;
-                default:
-                    printf("%-7s", "UNIMPLEMENTED");
-                    break;
-            }
+            Column<uint64_t>* col = dataset->getColumn<uint64_t>(j);
+            std::cout << std::left << std::setw(7) << col->rowCells[j];
         }
 
-        printf("\n");
+        std::cout << std::endl;
     }
 }
 
 int main() {
-    const uint32_t COLUMN_ARRAY_SIZE = 100 * sizeof(Column*);
-    const uint32_t DATASET_SIZE = sizeof(Table) + COLUMN_ARRAY_SIZE;
-    const uint32_t COLUMN_DATA_SIZE = 100 * sizeof(TableValue);
-    const uint32_t COLUMN_SIZE = sizeof(Column) + COLUMN_DATA_SIZE;
-
     // malloc dataset on host
-    Table* dataset = (Table*)malloc(DATASET_SIZE);
-    dataset->columns = (Column**)malloc(COLUMN_ARRAY_SIZE);
-    dataset->numCols = 0;
-    dataset->numRows = 0;
+    Table* dataset = new Table;
     
     // populate with dummy data
     for (size_t i=0; i<6; i++){
         // malloc column on host
-        Column* col = (Column*)malloc(COLUMN_SIZE);
-        col->data = (TableValue*)malloc(COLUMN_DATA_SIZE);
-        col->typeId = TYPE_ID::INT;
-        col->colIdx = i;
-        col->numRows = 0;
-        
+        Column<uint64_t>* col = new Column<uint64_t>(i);
+        col->rowCells = new uint64_t[MAX_ARRAY_VALUES];
         for (int j=0; j<20; j++) {
             col->numRows = j+1;
-            col->data[j].as_int = 10;
-            dataset->numRows = col->numRows;
+            col->rowCells[j] = 10;
         }
         
+        dataset->numRows = std::max(dataset->numRows, col->numRows);
         dataset->columns[i] = col;
         dataset->numCols = i+1;
     }
 
     printDataset(dataset);
     
-    int* hostDatasetSum = (int*)malloc(sizeof(int));
+    int* hostDatasetSum = new int;
     int* gpuDatasetSum = nullptr;
     cudaMalloc(&gpuDatasetSum, sizeof(int));
     cudaMemset(gpuDatasetSum, 0, sizeof(int));
 
     // send all the relevant dataset columns from the host memory to the gpu
     for (size_t i = 0; i < dataset->numCols; i++) {
-        Column* hostColumn = dataset->columns[i];
-        size_t rowDataSize = sizeof(TableValue) * hostColumn->numRows;
-        Column gpuColumn = *hostColumn;
-
-        cudaMalloc(&gpuColumn.data, rowDataSize);
-        cudaMemcpy(
-            gpuColumn.data, 
-            hostColumn->data, 
-            rowDataSize,
-            cudaMemcpyHostToDevice
-        );
+        Column<uint64_t>* hostColumn = dataset->getColumn<uint64_t>(i);
+        Column<uint64_t> gpuColumn = hostColumn->memMoveToDevice();
 
         DIV<<<3, 10>>>(gpuColumn, 10);
-        SUM<<<2, 10>>>(gpuColumn, gpuDatasetSum); // get sum of everything in the dataset
-
-        // bring data modified on the gpu back to host
-        // perhaps modify the data in DIV in shared memory then 
-        // memcpy all the shared memory back into hostcolumns at once
-        // rather than in this for loop
-        cudaMemcpy(
-            hostColumn->data, 
-            gpuColumn.data, 
-            rowDataSize,
-            cudaMemcpyDeviceToHost
-        );
-        cudaFree(gpuColumn.data);
+        SUM<<<3, 10>>>(gpuColumn, gpuDatasetSum);
+        
+        gpuColumn.memMoveToHost(hostColumn);
     }
 
     cudaDeviceSynchronize();
-
     cudaMemcpy(
         hostDatasetSum,
         gpuDatasetSum,
@@ -178,11 +163,9 @@ int main() {
         cudaMemcpyDeviceToHost
     );
 
-    printf("sum of everything: %d\n", *hostDatasetSum);
-
+    std::cout << "Sum calculated: " << *hostDatasetSum << std::endl;
+    
     printDataset(dataset);
-    free(dataset->columns);
-    free(dataset);
 
     return 0;
 }
